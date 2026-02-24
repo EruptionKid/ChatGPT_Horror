@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>NEVERHOME</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  #c { width:100%; height:100%; display:block; }
+
+  #overlay, #fallback {
+    position:fixed; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center;
+    background:rgba(0,0,0,0.86); color:#ddd; text-align:center; padding:22px; z-index:10;
+  }
+  #overlay h1 { margin:0 0 10px 0; letter-spacing:0.18em; font-weight:800; font-size: clamp(28px, 5vw, 54px); }
+  #overlay p { margin:0; max-width: 46ch; opacity:0.9; font-size: clamp(14px, 2.2vw, 16px); line-height:1.35; }
+  #overlay .sub { margin-top:10px; opacity:0.7; font-size: 13px; }
+  #overlay .row { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:18px; }
+
+  button {
+    padding:10px 16px; border:1px solid rgba(255,255,255,0.22); background:rgba(20,20,20,0.9);
+    color:#ddd; cursor:pointer; border-radius:10px; font-size:14px;
+  }
+  button:hover { background:rgba(32,32,32,0.95); }
+  button:active { transform: translateY(1px); }
+  #exitBtn {
+    position:fixed; top:10px; left:10px; z-index:9; padding:8px 12px;
+    background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.18); color:#9a9a9a;
+    border-radius:10px;
+  }
+  #exitBtn:hover { color:#fff; border-color:rgba(255,255,255,0.28); }
+
+  #hud {
+    position:fixed; top:10px; right:10px; z-index:9; display:flex; flex-direction:column; align-items:flex-end; gap:8px;
+    pointer-events:none;
+  }
+  #status {
+    pointer-events:none;
+    font-size:12px; color:#aaa; opacity:0.85; padding:8px 10px; border-radius:10px;
+    background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.12);
+    max-width: min(60vw, 520px);
+    text-align:right;
+    backdrop-filter: blur(6px);
+  }
+  #warning {
+    pointer-events:none;
+    font-size:13px; color:#ff4a4a; opacity:0; transition: opacity 1s;
+    padding:8px 10px; border-radius:10px;
+    background:rgba(10,0,0,0.45); border:1px solid rgba(255,74,74,0.26);
+    backdrop-filter: blur(6px);
+  }
+
+  #log {
+    position:fixed; left:10px; bottom:10px; z-index:9;
+    width:min(360px, 88vw);
+    font-size:12px; line-height:1.35;
+    color:#a9a9a9; opacity:0.78;
+    background:rgba(0,0,0,0.30); border:1px solid rgba(255,255,255,0.10);
+    border-radius:12px; padding:10px 10px;
+    max-height: 32vh;
+    overflow:hidden;
+    backdrop-filter: blur(6px);
+    pointer-events:none;
+    white-space:pre-line;
+  }
+
+  /* Subtle UI instability (not strobe) */
+  .glitch {
+    animation: drift 2.8s ease-in-out infinite;
+  }
+  @keyframes drift {
+    0% { filter:none; transform: translateX(0px); }
+    50% { filter: saturate(1.25) contrast(1.15); transform: translateX(2px); }
+    100% { filter:none; transform: translateX(0px); }
+  }
+
+  #fallback { display:none; }
+  #fallback h2 { margin:0 0 10px 0; font-size: 22px; }
+  #fallback p { margin:0; opacity:0.85; max-width: 56ch; line-height:1.35; }
+  #fallback code { opacity:0.9; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="overlay">
+  <h1>NEVERHOME</h1>
+  <p>
+    This is the public monitoring interface for a house that only exists while it is being observed.
+    <br><br>
+    You loaded the page. The house woke up.
+  </p>
+  <div class="sub" id="netHint">If you are offline, the bones may not arrive.</div>
+  <div class="row">
+    <button id="begin">Begin observation</button>
+    <button id="deeper" disabled title="Requires observation">Go deeper</button>
+  </div>
+</div>
+
+<div id="fallback">
+  <h2>NEVERHOME could not wake.</h2>
+  <p id="fbText">Something is missing. The house stays asleep.</p>
+</div>
+
+<button id="exitBtn" style="display:none;">Disconnect</button>
+
+<div id="hud">
+  <div id="warning">It sees you.</div>
+  <div id="status">Channel idle.</div>
+</div>
+
+<div id="log"></div>
+
+<script src="https://unpkg.com/three@0.161.0/build/three.min.js"></script>
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const overlay = document.getElementById("overlay");
+  const fallback = document.getElementById("fallback");
+  const fbText = document.getElementById("fbText");
+  const beginBtn = document.getElementById("begin");
+  const deeperBtn = document.getElementById("deeper");
+  const exitBtn = document.getElementById("exitBtn");
+  const logBox = document.getElementById("log");
+  const warning = document.getElementById("warning");
+  const status = document.getElementById("status");
+  const netHint = document.getElementById("netHint");
+
+  let started = false;
+  let phase = 0;
+  let renderer, scene, camera, clock;
+  let house, corridor, watcher, dust = [];
+  let pointer = { x:0, y:0, down:false };
+  let lastMove = Date.now();
+  let idleShown = false;
+  let stuckDisconnect = 0;
+  let proximity = 0; // scroll or "deeper" progress
+  let escalationFired = false;
+  let webAudio = null;
+
+  function log(msg) {
+    const lines = (logBox.textContent || "").split("\n").filter(Boolean);
+    lines.push(msg);
+    while(lines.length > 9) lines.shift();
+    logBox.textContent = lines.join("\n") + "\n";
+  }
+
+  function setStatus(msg) {
+    status.textContent = msg;
+  }
+
+  function showFallback(reason) {
+    overlay.style.display = "none";
+    fallback.style.display = "flex";
+    fbText.textContent = reason;
+  }
+
+  // Hint about offline CDN
+  try {
+    if (navigator.onLine === false) {
+      netHint.textContent = "You appear offline. If three.js can not load, the house cannot form.";
+    }
+  } catch(e) {}
+
+  // Wait a moment to see if THREE arrives, but do not pre-fail
+  let threeWait = setTimeout(() => {
+    if (!window.THREE && !started) {
+      netHint.textContent = "three.js has not loaded yet. If this stays, check your connection or allow unpkg.com.";
+    }
+  }, 900);
+
+  function ensureAudio() {
+    if (webAudio) return;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      webAudio = new AC();
+      const master = webAudio.createGain();
+      master.gain.value = 0.0;
+      master.connect(webAudio.destination);
+
+      // Slowly raise gain after start
+      const startAt = webAudio.currentTime + 0.02;
+      master.gain.setValueAtTime(0.0, startAt);
+      master.gain.linearRampToValueAtTime(0.06, startAt + 2.8);
+
+      // Low hum
+      const osc = webAudio.createOscillator();
+      const hum = webAudio.createGain();
+      osc.type = "sine";
+      osc.frequency.value = 48;
+      hum.gain.value = 0.8;
+      osc.connect(hum).connect(master);
+      osc.start();
+
+      // Whisper noise (filtered)
+      const bufSize = 2 * webAudio.sampleRate;
+      const noiseBuf = webAudio.createBuffer(1, bufSize, webAudio.sampleRate);
+      const data = noiseBuf.getChannelData(0);
+      for (let i=0;i<bufSize;i++) data[i] = (Math.random()*2-1) * 0.25;
+      const noise = webAudio.createBufferSource();
+      noise.buffer = noiseBuf;
+      noise.loop = true;
+
+      const bp = webAudio.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = 900;
+      bp.Q.value = 0.8;
+
+      const ng = webAudio.createGain();
+      ng.gain.value = 0.0;
+
+      noise.connect(bp).connect(ng).connect(master);
+      noise.start();
+
+      // Expose for pulses
+      webAudio._master = master;
+      webAudio._noiseGain = ng;
+      webAudio._noiseFilter = bp;
+    } catch(e) {
+      webAudio = null;
+    }
+  }
+
+  function pulseWhisper(intensity) {
+    if (!webAudio || !webAudio._noiseGain) return;
+    const t = webAudio.currentTime;
+    const g = webAudio._noiseGain.gain;
+    const f = webAudio._noiseFilter.frequency;
+    const amt = Math.max(0, Math.min(1, intensity));
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(0.02 + amt*0.12, t + 0.05);
+    g.linearRampToValueAtTime(0.00, t + 0.55);
+    f.setValueAtTime(700 + amt*1100, t);
+    f.linearRampToValueAtTime(500 + amt*900, t + 0.55);
+  }
+
+  function initThree() {
+    clearTimeout(threeWait);
+
+    if (!window.THREE) {
+      showFallback("three.js did not load. This page needs the script from unpkg.com to assemble the interface.");
+      return false;
+    }
+
+    const THREE = window.THREE;
+
+    // Try to create renderer, do not show fallback until it actually fails
+    try {
+      renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias: false,
+        powerPreference: "high-performance",
+        alpha: false
+      });
+    } catch (e) {
+      showFallback("WebGL renderer could not initialize. WebGL may be disabled in your browser settings.");
+      return false;
+    }
+
+    // Confirm we really got a WebGL context
+    try {
+      const gl = renderer.getContext();
+      if (!gl) {
+        showFallback("WebGL context could not be acquired. The house cannot form in this environment.");
+        return false;
+      }
+    } catch(e) {
+      showFallback("WebGL context check failed. The house cannot form.");
+      return false;
+    }
+
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.06, 120);
+    camera.position.set(0, 1.35, 7.2);
+
+    clock = new THREE.Clock();
+
+    // Lighting: uneasy, shifting, low contrast
+    const ambient = new THREE.AmbientLight(0x101014, 0.55);
+    scene.add(ambient);
+
+    const key = new THREE.SpotLight(0xffffff, 1.2, 50, Math.PI * 0.24, 0.65, 1);
+    key.position.set(3.5, 6.5, 4.2);
+    key.target.position.set(0, 1, 0);
+    scene.add(key);
+    scene.add(key.target);
+
+    const back = new THREE.PointLight(0x4422aa, 0.25, 40);
+    back.position.set(-6, 2, -8);
+    scene.add(back);
+
+    const low = new THREE.PointLight(0x330000, 0.18, 35);
+    low.position.set(0, -2.2, 2);
+    scene.add(low);
+
+    // Materials
+    const mWall = new THREE.MeshStandardMaterial({ color: 0x0b0b0d, roughness: 0.95, metalness: 0.08 });
+    const mTrim = new THREE.MeshStandardMaterial({ color: 0x121218, roughness: 0.85, metalness: 0.12 });
+    const mEye = new THREE.MeshStandardMaterial({ color: 0x0d0d0f, roughness: 0.35, metalness: 0.35, emissive: 0x000000 });
+
+    // "House" as an impossible corridor box with inner frame
+    house = new THREE.Group();
+
+    const shell = new THREE.Mesh(new THREE.BoxGeometry(2.6, 2.6, 2.6), mWall);
+    shell.position.y = 1.1;
+    house.add(shell);
+
+    const frame = new THREE.Mesh(new THREE.BoxGeometry(2.25, 2.25, 2.25), mTrim);
+    frame.position.y = 1.1;
+    frame.scale.set(0.98, 0.98, 0.98);
+    house.add(frame);
+
+    // An "opening" that feels like depth
+    const mouth = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.25, 0.2), mTrim);
+    mouth.position.set(0, 1.0, 1.32);
+    house.add(mouth);
+
+    // Corridor tunnel
+    corridor = new THREE.Group();
+    const segCount = 16;
+    for (let i=0;i<segCount;i++) {
+      const z = -i * 1.35 - 0.6;
+      const ring = new THREE.Mesh(new THREE.BoxGeometry(1.55, 1.75, 0.15), mTrim);
+      ring.position.set(0, 1.0, z);
+      ring.scale.set(1.0 + i*0.018, 1.0 + i*0.02, 1.0);
+      corridor.add(ring);
+
+      if (i % 2 === 0) {
+        const slat = new THREE.Mesh(new THREE.BoxGeometry(1.65, 0.06, 0.08), mWall);
+        slat.position.set(0, 1.55 + (i%4===0 ? 0.03 : -0.03), z - 0.08);
+        corridor.add(slat);
+      }
+    }
+    house.add(corridor);
+
+    // Watcher: a small sphere that is only "obvious" when idle
+    watcher = new THREE.Mesh(new THREE.SphereGeometry(0.14, 18, 18), mEye);
+    watcher.position.set(0, 1.55, -6.8);
+    watcher.visible = false;
+    house.add(watcher);
+
+    scene.add(house);
+
+    // Dust motes
+    const dustMat = new THREE.MeshStandardMaterial({ color: 0x16161a, roughness: 0.2, metalness: 0.0, emissive: 0x040404 });
+    for (let i=0;i<120;i++) {
+      const d = new THREE.Mesh(new THREE.SphereGeometry(0.02, 10, 10), dustMat);
+      d.position.set((Math.random()*2-1)*5.5, Math.random()*3.0, (Math.random()*2-1)*9.0);
+      d.userData = { s: 0.15 + Math.random()*0.45, p: Math.random()*Math.PI*2 };
+      dust.push(d);
+      scene.add(d);
+    }
+
+    return true;
+  }
+
+  function resize() {
+    if (!renderer || !camera) return;
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener("resize", resize);
+
+  // Pointer interaction
+  window.addEventListener("mousemove", (e) => {
+    pointer.x = (e.clientX / window.innerWidth) * 2 - 1;
+    pointer.y = -((e.clientY / window.innerHeight) * 2 - 1);
+    lastMove = Date.now();
+  }, { passive:true });
+
+  window.addEventListener("touchstart", (e) => { pointer.down = true; lastMove = Date.now(); }, { passive:true });
+  window.addEventListener("touchend", (e) => { pointer.down = false; lastMove = Date.now(); }, { passive:true });
+  window.addEventListener("touchmove", (e) => {
+    if (!e.touches || !e.touches[0]) return;
+    const t = e.touches[0];
+    pointer.x = (t.clientX / window.innerWidth) * 2 - 1;
+    pointer.y = -((t.clientY / window.innerHeight) * 2 - 1);
+    lastMove = Date.now();
+  }, { passive:true });
+
+  // Wheel / scroll: the house becomes closer
+  window.addEventListener("wheel", (e) => {
+    if (!started) return;
+    const dir = Math.sign(e.deltaY || 0);
+    proximity += dir * 0.06;
+    proximity = Math.max(-0.2, Math.min(1.6, proximity));
+    log(dir > 0 ? "Depth request accepted." : "Depth request reversed.");
+    pulseWhisper(Math.abs(dir) * 0.35 + Math.min(1, proximity)*0.25);
+    lastMove = Date.now();
+  }, { passive:true });
+
+  // "Dishonest" exit control
+  exitBtn.addEventListener("click", () => {
+    if (!started) return;
+    stuckDisconnect++;
+    const lines = [
+      "Disconnecting…",
+      "Closing channel…",
+      "Releasing observer handle…",
+      "Saving state…",
+      "Almost done…"
+    ];
+    setStatus(lines[Math.min(lines.length-1, stuckDisconnect-1)]);
+    log(stuckDisconnect === 1 ? "Operator requested disconnect." : "Disconnect request repeated.");
+    pulseWhisper(0.55);
+
+    // It does not really disconnect, it makes things worse
+    if (stuckDisconnect === 1) {
+      setTimeout(() => {
+        log("Disconnect acknowledged. Stand by.");
+      }, 420);
+    } else if (stuckDisconnect === 2) {
+      warning.style.opacity = 1;
+      log("Disconnect refused. The house stays awake while observed.");
+      overlay.classList.add("glitch");
+      setStatus("Channel unstable.");
+      proximity = Math.min(1.6, proximity + 0.18);
+    } else {
+      warning.style.opacity = 1;
+      log("It is not a button. It is a confession.");
+      setStatus("Observer trapped.");
+      proximity = Math.min(1.6, proximity + 0.22);
+      escalationFired = true;
+      phase = Math.max(phase, 3);
+    }
+  });
+
+  deeperBtn.addEventListener("click", () => {
+    if (!started) return;
+    proximity = Math.min(1.6, proximity + 0.22);
+    log("Manual descent requested.");
+    pulseWhisper(0.45);
+    lastMove = Date.now();
+  });
+
+  // Attempt to leave: subtle escalation, no flashing
+  window.addEventListener("beforeunload", (e) => {
+    if (!started) return;
+    escalationFired = true;
+    phase = Math.max(phase, 3);
+    warning.style.opacity = 1;
+    try { pulseWhisper(0.9); } catch(_) {}
+  });
+
+  function tick() {
+    requestAnimationFrame(tick);
+    if (!started || !renderer || !scene || !camera || !clock) return;
+
+    const THREE = window.THREE;
+    const t = clock.getElapsedTime();
+
+    // Phases: 0 calm, 1 adjusted, 2 aware, 3 fixed (escalation)
+    if (t > 18 && phase < 1) {
+      phase = 1;
+      log("Phase shift: baseline geometry re-compiled around your position.");
+      setStatus("Observation running.");
+      deeperBtn.disabled = false;
+      pulseWhisper(0.22);
+    }
+    if (t > 42 && phase < 2) {
+      phase = 2;
+      log("Phase shift: anomaly detected behind the interface.");
+      setStatus("House responding.");
+      warning.style.opacity = 0.35;
+      pulseWhisper(0.35);
+    }
+
+    // Escalation event: after 60 seconds OR repeated disconnect OR leaving attempt
+    if ((t > 60 || escalationFired || stuckDisconnect >= 3) && phase < 3) {
+      phase = 3;
+      escalationFired = true;
+      warning.style.opacity = 1;
+      log("Escalation: observer acquired. DO NOT CLOSE YOUR EYES.");
+      setStatus("It is watching back.");
+      pulseWhisper(0.9);
+      // UI destabilization, gentle
+      status.classList.add("glitch");
+      logBox.classList.add("glitch");
+    }
+
+    // Idle mechanic: watcher appears only when you stop moving
+    const idle = (Date.now() - lastMove) > 3800;
+    if (idle && !idleShown) {
+      idleShown = true;
+      log("Input silent. The house re-checks the observer.");
+      pulseWhisper(0.25);
+    }
+    if (!idle) idleShown = false;
+
+    if (watcher) watcher.visible = (idle && phase >= 1);
+
+    // Scene mood changes per phase
+    const bg = scene.background;
+    if (phase === 0) bg.set(0x000000);
+    if (phase === 1) bg.set(0x040009);
+    if (phase === 2) bg.set(0x070010);
+    if (phase >= 3) bg.set(0x0d0000);
+
+    // Camera: uneasy orbit + slow pull-in based on proximity and phase
+    const orbit = 0.17 + (phase * 0.03);
+    const baseR = 7.2 - Math.min(2.4, t * 0.03) - proximity * 1.35;
+    const r = Math.max(2.3, baseR);
+
+    const wob = (phase >= 2) ? 0.09 : 0.05;
+    const px = pointer.x * (phase >= 1 ? 0.65 : 0.4);
+    const py = pointer.y * (phase >= 1 ? 0.35 : 0.22);
+
+    camera.position.x = Math.sin(t * orbit) * r + px;
+    camera.position.z = Math.cos(t * orbit) * r + 0.4;
+    camera.position.y = 1.35 + Math.sin(t * 0.55) * wob + py;
+
+    // Look-at drifts slightly off-center at higher phases (feels watched)
+    const lookBias = (phase >= 2) ? 0.12 : 0.04;
+    const target = new THREE.Vector3(0 + px * lookBias, 1.05 + py * 0.08, -0.8 - proximity * 1.8);
+    camera.lookAt(target);
+
+    // House motion: breathing + reluctant tracking
+    if (house) {
+      const breathe = 1 + Math.sin(t * 1.15) * 0.02 + Math.sin(t * 0.37) * 0.012;
+      house.scale.set(breathe, breathe, breathe);
+
+      const track = (phase >= 1) ? 0.20 : 0.12;
+      house.rotation.y += 0.003 + px * 0.008 * track;
+      house.rotation.x += 0.001 + py * 0.006 * track;
+
+      // Corridor shifts deeper as proximity increases
+      corridor.position.z = -proximity * 1.8;
+
+      // In phase 3, it "fixes" you by subtly recentering regardless of input
+      if (phase >= 3) {
+        house.rotation.y += Math.sin(t * 0.9) * 0.002;
+        house.rotation.x = house.rotation.x * 0.96 + Math.sin(t * 0.7) * 0.02;
+      }
+    }
+
+    // Watcher "eye" behavior
+    if (watcher) {
+      if (phase >= 2) {
+        watcher.material.emissive.setHex(idle ? 0x6a0000 : 0x000000);
+        watcher.material.color.setHex(idle ? 0xff4a4a : 0x0d0d0f);
+      } else {
+        watcher.material.emissive.setHex(0x000000);
+        watcher.material.color.setHex(0x0d0d0f);
+      }
+      if (phase >= 3) {
+        const throb = 0.12 + Math.sin(t * 2.0) * 0.04;
+        watcher.scale.set(1+throb, 1+throb, 1+throb);
+      } else {
+        watcher.scale.set(1,1,1);
+      }
+    }
+
+    // Dust drift
+    for (let i=0;i<dust.length;i++) {
+      const d = dust[i];
+      const s = d.userData.s;
+      const p = d.userData.p;
+      d.position.x += Math.sin(t*0.25 + p) * 0.0012 * s;
+      d.position.y += Math.cos(t*0.18 + p) * 0.0008 * s;
+      d.position.z += Math.sin(t*0.22 + p) * 0.0010 * s;
+      if (d.position.z > 10) d.position.z = -10;
+      if (d.position.z < -10) d.position.z = 10;
+    }
+
+    // Occasional, gentle text rewrite (paranoia mechanic)
+    if (phase >= 2 && Math.random() < 0.0035) {
+      const phrases = [
+        "Channel stable.",
+        "Channel stable.",
+        "Channel stable.",
+        "Channel stable.",
+        "Channel stable.",
+        "Channel stable.",
+        "You are still looking.",
+        "You are still looking.",
+        "Do not minimize this window.",
+        "The house is closer than the camera says."
+      ];
+      setStatus(phrases[Math.floor(Math.random()*phrases.length)]);
+    }
+
+    // Whisper pulses on certain milestones
+    if (phase === 1 && Math.random() < 0.0015) pulseWhisper(0.12);
+    if (phase === 2 && Math.random() < 0.0022) pulseWhisper(0.18);
+    if (phase >= 3 && Math.random() < 0.0030) pulseWhisper(0.22);
+
+    renderer.render(scene, camera);
+  }
+
+  function start() {
+    if (started) return;
+    started = true;
+
+    // Must be user gesture for audio resume
+    ensureAudio();
+    try {
+      if (webAudio && webAudio.state === "suspended") webAudio.resume();
+    } catch(e) {}
+
+    const ok = initThree();
+    if (!ok) return;
+
+    overlay.style.display = "none";
+    exitBtn.style.display = "block";
+
+    log("Observation channel opened.");
+    log("NEVERHOME reports: ACTIVE.");
+    setStatus("Observation running.");
+
+    resize();
+    tick();
+  }
+
+  beginBtn.addEventListener("click", start);
+
+  // Extra robustness: if someone tries to start before THREE is ready, retry once
+  beginBtn.addEventListener("click", () => {
+    setTimeout(() => {
+      if (started) return;
+      if (!window.THREE) {
+        // If still not loaded, explain without blaming WebGL
+        showFallback("three.js is not available yet. If you are offline, reconnect and reload. If you are online, allow unpkg.com.");
+      }
+    }, 1100);
+  });
+
+})();
+</script>
+</body>
+</html>
